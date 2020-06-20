@@ -1,0 +1,477 @@
+- hosts: all
+  tasks:
+    - name: manage /etc/hosts
+      become: yes
+      lineinfile:
+        dest: /etc/hosts
+        regexp: '^{{ hostvars[item].internal_ip }} '
+        line: '{{ hostvars[item].internal_ip }} {{ item }} {{ hostvars[item].aliases | default("") }}'
+        state: present
+      when: hostvars[item].internal_ip is defined
+      with_items: '{{ groups["all"] }}'
+    - name: persistent pod subnet routes
+      become: yes
+      blockinfile:
+        path: /etc/netplan/50-vagrant.yaml
+        block: |2
+                routes:
+                  {% for worker in groups['workers'] %}{% if worker != inventory_hostname -%}
+                  - { to: {{ hostvars[worker].pod_cidr }}, via: {{ hostvars[worker].internal_ip }} }
+                  {% if inventory_hostname.startswith('balancer') -%}
+                  - { to: 10.32.0.0/16, via: {{ hostvars[worker].internal_ip }} }
+                  {% endif -%} 
+                  {% endif %}{% endfor -%}
+        insertafter: "{{ hostvars[inventory_hostname].internal_ip }}"
+      notify: apply netplan
+  handlers:
+    - name: apply netplan
+      become: yes
+      shell:
+        cmd: netplan apply
+
+- hosts: balancers
+  tasks:
+    - name: install haproxy
+      become: yes
+      apt:
+        name: haproxy
+        state: latest
+    - name: enable ip forwarding
+      become: yes
+      sysctl:
+        name: net.ipv4.conf.all.forwarding
+        value: '1'
+
+- hosts: controllers
+  vars:
+    control_plane_services:
+      - kube-apiserver
+      - kube-controller-manager
+      - kube-scheduler
+    random_controller: '{{ groups["controllers"] | random }}'
+  tasks:
+    - name: get control plane binaries
+      become: yes
+      get_url:
+        url: '{{ item[0] }}'
+        dest: '/usr/local/bin/{{ item[1]}}'
+        checksum: '{{ item[2] }}'
+        mode: '0755'
+        owner: root
+        group: root
+      loop:
+        - ['https://storage.googleapis.com/kubernetes-release/release/v1.15.3/bin/linux/amd64/kube-apiserver',
+           'kube-apiserver',
+           'sha256:a2883b4a5e97afd3c6f9fbab3e9c3e22b95b7977ef8a74263f3f8e3f8af5344a']
+        - ['https://storage.googleapis.com/kubernetes-release/release/v1.15.3/bin/linux/amd64/kube-controller-manager',
+           'kube-controller-manager',
+           'sha256:a0c7a5b70d988c9923bb2b3c7d6ce15d5cc65832ea251688043df8ee086680f0']
+        - ['https://storage.googleapis.com/kubernetes-release/release/v1.15.3/bin/linux/amd64/kube-scheduler',
+           'kube-scheduler',
+           'sha256:130328f89d00afb848a74d3ec8ddaca331a8257a278ec414f3e17089f9307ce0']
+        - ['https://storage.googleapis.com/kubernetes-release/release/v1.15.3/bin/linux/amd64/kubectl',
+           'kubectl',
+           'sha256:6e805054a1fb2280abb53f75b57a1b92bf9c66ffe0d2cdcd46e81b079d93c322']
+    - name: mkdir for controlplane
+      become: yes
+      file:
+        path: '{{ item }}'
+        state: directory
+        mode: '0775'
+        owner: root
+        group: root
+      loop:
+        - /var/lib/kubernetes
+        - /etc/kubernetes/config
+    - name: place certs & configs
+      become: yes
+      copy:
+        remote_src: true
+        src: '{{ item[0] }}'
+        dest: /var/lib/kubernetes
+        mode: '{{ item[1] | default("0600") }}'
+        owner: root
+        group: root
+      loop:
+        - [/vagrant/certs/ca.pem, '0644']
+        - [/vagrant/certs/ca-key.pem]
+        - [/vagrant/certs/kubernetes.pem, '0644']
+        - [/vagrant/certs/kubernetes-key.pem]
+        - [/vagrant/certs/service-account.pem, '0644']
+        - [/vagrant/certs/service-account-key.pem]
+        - [/vagrant/configs/encryption-config.yaml]
+        - [/vagrant/configs/kube-controller-manager.kubeconfig]
+        - [/vagrant/configs/kube-scheduler.kubeconfig]
+        - [/vagrant/configs/admin.kubeconfig]
+    - name: create scheduler conf
+      become: yes
+      copy:
+        content: |
+          apiVersion: kubescheduler.config.k8s.io/v1alpha1
+          kind: KubeSchedulerConfiguration
+          clientConnection:
+            kubeconfig: "/var/lib/kubernetes/kube-scheduler.kubeconfig"
+          leaderElection:
+            leaderElect: true
+        dest: /etc/kubernetes/config/kube-scheduler.yaml
+    - name: create service files
+      become: yes
+      template:
+        src: '{{ item }}.j2'
+        dest: '/etc/systemd/system/{{ item }}.service'
+        mode: '0644'
+        owner: root
+        group: root
+      notify:
+        - 'restart {{ item }}'
+      loop: '{{ control_plane_services }}'
+    - name: install nginx
+      become: yes
+      apt:
+        name: nginx
+        state: latest
+    - name: configure nginx
+      become: yes
+      copy:
+        content: |
+          server {
+            listen      80;
+            server_name kubernetes.default.svc.cluster.local;
+          
+            location /healthz {
+              proxy_pass https://127.0.0.1:6443/healthz;
+              proxy_ssl_trusted_certificate /var/lib/kubernetes/ca.pem;
+            }
+          }
+        dest: /etc/nginx/sites-available/kubernetes.default.svc.cluster.local
+        mode: '0644'
+        owner: root
+        group: root
+      notify: 'restart nginx'
+    - name: make site active
+      become: yes
+      file:
+        state: link
+        src: /etc/nginx/sites-available/kubernetes.default.svc.cluster.local
+        path: /etc/nginx/sites-enabled/kubernetes.default.svc.cluster.local
+    - name: start services
+      become: yes
+      systemd:
+        name: '{{ item }}'
+        daemon_reload: true
+        enabled: true
+        state: started
+      loop: '{{ control_plane_services + ["nginx"] }}'
+    - name: 'setup RBAC'
+      become: yes
+      when: inventory_hostname == random_controller
+      shell:
+        cmd: 'kubectl apply --kubeconfig /var/lib/kubernetes/admin.kubeconfig -f -'
+        stdin: |
+          ---
+          apiVersion: rbac.authorization.k8s.io/v1beta1
+          kind: ClusterRole
+          metadata:
+            annotations:
+              rbac.authorization.kubernetes.io/autoupdate: true
+            labels:
+              kubernetes.io/bootstrapping: rbac-defaults
+            name: system:kube-apiserver-to-kubelet
+          rules:
+            - apiGroups:
+                - ""
+              resources:
+                - nodes/proxy
+                - nodes/stats
+                - nodes/log
+                - nodes/spec
+                - nodes/metrics
+              verbs:
+                - "*"
+          ...
+          ---
+          apiVersion: rbac.authorization.k8s.io/v1beta1
+          kind: ClusterRoleBinding
+          metadata:
+            name: system:kube-apiserver
+            namespace: ""
+          roleRef:
+            apiGroup: rbac.authorization.k8s.io
+            kind: ClusterRole
+            name: system:kube-apiserver-to-kubelet
+          subjects:
+            - apiGroup: rbac.authorization.k8s.io
+              kind: User
+              name: kubernetes
+          ...
+
+
+  handlers:
+    - name: 'restart kube-apiserver'
+      become: yes
+      systemd:
+        name: 'kube-apiserver'
+        daemon_reload: true
+        enabled: true
+        state: restarted
+    - name: 'restart kube-controller-manager'
+      become: yes
+      systemd:
+        name: 'kube-controller-manager'
+        daemon_reload: true
+        enabled: true
+        state: restarted
+    - name: 'restart kube-scheduler'
+      become: yes
+      systemd:
+        name: 'kube-scheduler'
+        daemon_reload: true
+        enabled: true
+        state: restarted
+    - name: 'restart nginx'
+      become: yes
+      systemd:
+        name: 'nginx'
+        daemon_reload: true
+        enabled: true
+        state: restarted
+
+- hosts: workers
+  vars:
+    worker_services:
+      - containerd
+      - kubelet
+      - kube-proxy
+  tasks:
+    - name: install deps
+      become: yes
+      apt:
+        name: '{{ item }}'
+        state: latest
+      loop:
+        - socat
+        - conntrack
+        - ipset
+    - name: swapoff
+      become: yes
+      shell:
+        cmd: swapoff -a
+    - name: make dirs
+      become: yes
+      file:
+        path: '{{ item }}'
+        state: directory
+        mode: '0755'
+        owner: root
+        group: root
+      loop:
+        - /etc/cni/net.d
+        - /etc/containerd
+        - /opt/cni/bin
+        - /var/lib/kubelet
+        - /var/lib/kube-proxy
+        - /var/lib/kubernetes
+        - /var/cache/tarballs
+    - name: place certs & configs
+      become: yes
+      copy:
+        remote_src: true
+        src: '{{ item[0] }}'
+        dest: '{{ item[1] }}'
+        mode: '{{ item[3] | default("0600") }}'
+        owner: root
+        group: root
+      loop:
+        - [ /vagrant/certs/ca.pem, /var/lib/kubernetes ]
+        - [ '/vagrant/configs/{{ inventory_hostname }}.kubeconfig', /var/lib/kubelet/kubeconfig ]
+        - [ '/vagrant/certs/{{ inventory_hostname }}-key.pem', /var/lib/kubelet/key.pem ]
+        - [ '/vagrant/certs/{{ inventory_hostname }}.pem', /var/lib/kubelet/cert.pem, '0644' ]
+        - [ /vagrant/configs/kube-proxy.kubeconfig, /var/lib/kube-proxy/kubeconfig ]
+    - name: get worker binaries
+      become: yes
+      get_url:
+        url: '{{ item[0] }}'
+        dest: '/usr/local/bin/{{ item[1]}}'
+        checksum: '{{ item[2] }}'
+        mode: '0755'
+        owner: root
+        group: adm
+      loop:
+        - ['https://storage.googleapis.com/kubernetes-release/release/v1.15.3/bin/linux/amd64/kube-proxy',
+           'kube-proxy',
+           'sha256:3cc920283a22896fe37e86adab55879061de30076aa2785c76bdac19995b720d']
+        - ['https://storage.googleapis.com/kubernetes-release/release/v1.15.3/bin/linux/amd64/kubelet',
+           'kubelet',
+           'sha256:dc08c9ad350d0046bc2ec910dcd266bd30cb6e7ef1f9170bb8df455d9d083d73']
+        - ['https://storage.googleapis.com/kubernetes-release/release/v1.15.3/bin/linux/amd64/kubectl',
+           'kubectl',
+           'sha256:6e805054a1fb2280abb53f75b57a1b92bf9c66ffe0d2cdcd46e81b079d93c322']
+        - ['https://github.com/opencontainers/runc/releases/download/v1.0.0-rc8/runc.amd64',
+           'runc',
+           'sha256:0a9ac20ee52b6084ad161d516cc4e6248c5fd0cdf1fd4a7ac27f5243675632f9']
+    - name: get worker tarballs
+      become: yes
+      get_url:
+        url: '{{ item[0] }}'
+        dest: '/var/cache/tarballs/{{ item[1] }}'
+        checksum: '{{ item[2] }}'
+        mode: '0644'
+        owner: root
+        group: root
+      loop:
+        - ['https://github.com/kubernetes-sigs/cri-tools/releases/download/v1.15.0/crictl-v1.15.0-linux-amd64.tar.gz',
+           'crictl-v1.15.0-linux-amd64.tar.gz',
+           'sha256:c3b71be1f363e16078b51334967348aab4f72f46ef64a61fe7754e029779d45a']
+        - ['https://github.com/containerd/containerd/releases/download/v1.2.9/containerd-1.2.9.linux-amd64.tar.gz',
+           'containerd-1.2.9.linux-amd64.tar.gz',
+           'sha256:6c5440c0bef11a7bdd599a0b7b30471d7c3c116faaf5dfa1bdfe69175b1767a4']
+        - ['https://github.com/containernetworking/plugins/releases/download/v0.8.2/cni-plugins-linux-amd64-v0.8.2.tgz',
+           'cni-plugins-linux-amd64-v0.8.2.tgz',
+           'sha256:21283754ffb953329388b5a3c52cef7d656d535292bda2d86fcdda604b482f85']
+    - name: unpack worker tarballs
+      become: yes
+      unarchive:
+        remote_src: true
+        src: '/var/cache/tarballs/{{ item[0] }}'
+        dest: '{{ item[1] }}'
+        mode: '0755'
+        owner: root
+        group: root
+      loop:
+        - ['crictl-v1.15.0-linux-amd64.tar.gz', '/usr/local/bin']
+        - ['containerd-1.2.9.linux-amd64.tar.gz', '/usr/local']
+        - ['cni-plugins-linux-amd64-v0.8.2.tgz', '/opt/cni/bin']
+    - name: configure CNI bridge
+      become: yes
+      copy:
+        content: |
+          {
+              "cniVersion": "0.3.1",
+              "name": "bridge",
+              "type": "bridge",
+              "bridge": "cnio0",
+              "isGateway": true,
+              "ipMasq": true,
+              "ipam": {
+                  "type": "host-local",
+                  "ranges": [
+                    [{"subnet": "{{ hostvars[inventory_hostname].pod_cidr }}"}]
+                  ],
+                  "routes": [{"dst": "0.0.0.0/0"}]
+              }
+          }
+        dest: /etc/cni/net.d/10-bridge.conf
+        mode: '0644'
+        owner: root
+        group: root
+    - name: configure CNI loopback
+      become: yes
+      copy:
+        content: |
+          {
+              "cniVersion": "0.3.1",
+              "name": "lo",
+              "type": "loopback"
+          }
+        dest: /etc/cni/net.d/99-loopback.conf
+        mode: '0644'
+        owner: root
+        group: root
+    - name: configure containerd
+      become: yes
+      copy:
+        content: |
+          [plugins]
+            [plugins.cri.containerd]
+              snapshotter = "overlayfs"
+              [plugins.cri.containerd.default_runtime]
+                runtime_type = "io.containerd.runtime.v1.linux"
+                runtime_engine = "/usr/local/bin/runc"
+                runtime_root = ""
+        dest: /etc/containerd/config.toml
+        mode: '0644'
+        owner: root
+        group: root
+    - name: configure kubelet
+      become: yes
+      copy:
+        content: |
+          kind: KubeletConfiguration
+          apiVersion: kubelet.config.k8s.io/v1beta1
+          authentication:
+            anonymous:
+              enabled: false
+            webhook:
+              enabled: true
+            x509:
+              clientCAFile: "/var/lib/kubernetes/ca.pem"
+          authorization:
+            mode: Webhook
+          clusterDomain: "cluster.local"
+          clusterDNS:
+            - "10.32.0.10"
+          podCIDR: "{{ hostvars[inventory_hostname].pod_cidr }}"
+          resolvConf: "/run/systemd/resolve/resolv.conf"
+          runtimeRequestTimeout: "15m"
+          tlsCertFile: "/var/lib/kubelet/cert.pem"
+          tlsPrivateKeyFile: "/var/lib/kubelet/key.pem"
+        dest: /var/lib/kubelet/kubelet-config.yaml
+        mode: '0644'
+        owner: root
+        group: root
+    - name: configure kube-proxy
+      become: yes
+      copy:
+        content: |
+          kind: KubeProxyConfiguration
+          apiVersion: kubeproxy.config.k8s.io/v1alpha1
+          clientConnection:
+            kubeconfig: "/var/lib/kube-proxy/kubeconfig"
+          mode: "iptables"
+          clusterCIDR: "10.200.0.0/16"
+        dest: /var/lib/kube-proxy/kube-proxy-config.yaml
+        mode: '0644'
+        owner: root
+        group: root
+    - name: create service files
+      become: yes
+      template:
+        src: '{{ item }}.j2'
+        dest: '/etc/systemd/system/{{ item }}.service'
+        mode: '0644'
+        owner: root
+        group: root
+      notify:
+        - 'restart {{ item }}'
+      loop: '{{ worker_services }}'
+    - name: start services
+      become: yes
+      systemd:
+        name: '{{ item }}'
+        daemon_reload: true
+        enabled: true
+        state: started
+      loop: '{{ worker_services }}'
+
+  handlers:
+    - name: 'restart containerd'
+      become: yes
+      systemd:
+        name: 'containerd'
+        daemon_reload: true
+        enabled: true
+        state: restarted
+    - name: 'restart kubelet'
+      become: yes
+      systemd:
+        name: 'kubelet'
+        daemon_reload: true
+        enabled: true
+        state: restarted
+    - name: 'restart kube-proxy'
+      become: yes
+      systemd:
+        name: 'kube-proxy'
+        daemon_reload: true
+        enabled: true
+        state: restarted
